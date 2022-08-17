@@ -1,0 +1,79 @@
+/*
+    Created on 08-1-2022
+    By Sean Brittian
+    Updated on 08-1-2022
+    By Sean Brittian
+    Description: Transfer table data which meet criteria to an identical database
+*/
+
+USE MES_PROD_REP
+
+DECLARE @Source VARCHAR(200) = 'dbo.'
+    , @TARGET VARCHAR(200) = 'dbo.'
+    , @i INT = 1
+
+
+
+DECLARE @ColumnTab TABLE(id INT IDENTITY(1,1), SourceName VARCHAR(200), TargetName VARCHAR(200), TableName VARCHAR(100))
+INSERT INTO @ColumnTab(SourceName, TargetName, TableName)
+SELECT DISTINCT /* TOP 2 */ CONCAT(@Source, TABLE_NAME), CONCAT(@TARGET, TABLE_NAME), TABLE_NAME  FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME LIKE 'MES_data_%'
+
+
+    WHILE @i < (SELECT COUNT(*) FROM @ColumnTab)
+        BEGIN
+            DECLARE @SourceTable VARCHAR(200) = (SELECT TOP 1 SourceName FROM @ColumnTab)
+            , @TargetTable VARCHAR(200) = (SELECT TOP 1 TargetName FROM @ColumnTab)
+            , @TableName VARCHAR(100) = (SELECT TOP 1 TableName FROM @ColumnTab)
+
+            DECLARE @PKName VARCHAR(100) = (select COLUMN_NAME from INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE   WHERE TABLE_NAME LIKE  @TableName)
+            ,@ColumnString VARCHAR(MAX) = ''
+                ,@ColumnSourceString VARCHAR(MAX) = ''
+
+            DECLARE @ColumnNames TABLE (ColumnName VARCHAR(200))
+                INSERT INTO @ColumnNames(ColumnName)
+                    SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @TableName
+            SELECT @SourceTable, @TargetTable
+            SELECT * FROM @ColumnNames
+
+                WHILE (SELECT COUNT(*) FROM @ColumnNames) > 0
+                    BEGIN
+                        IF (SELECT COUNT(*) FROM @ColumnNames) > 1
+                            begin
+                                SET @ColumnString = @ColumnString + (SELECT TOP 1 IIF(ColumnName = 'Group', '[Group]', ColumnName) FROM @ColumnNames)+ ', '
+                                SET @ColumnSourceString = @ColumnSourceString + 'SOURCE.'+(SELECT TOP 1 IIF(ColumnName = 'Group', '[Group]', ColumnName) FROM @ColumnNames)+ ', '
+                            end
+                        ELSE
+                            begin
+                                SET @ColumnString = @ColumnString + (SELECT TOP 1 IIF(ColumnName = 'Group', '[Group]', ColumnName) FROM @ColumnNames)
+                                SET @ColumnSourceString = @ColumnSourceString + 'SOURCE.'+(SELECT TOP 1 IIF(ColumnName = 'Group', '[Group]', ColumnName) FROM @ColumnNames)
+                            end
+
+                        DELETE FROM @ColumnNames
+                        WHERE ColumnName = (SELECT TOP 1 ColumnName FROM @ColumnNames)
+                    end
+            --SELECT @ColumnString
+
+            DECLARE @String VARCHAR(MAX)=
+
+                    'SET IDENTITY_INSERT '+ @TargetTable+' ON
+                    INSERT INTO '+ @TargetTable+' ( '+@ColumnString+' )
+                    ( SELECT * FROM '+@SourceTable+' WHERE  '+ @SourceTable+'.'+@PKName+' NOT IN
+                        (SELECT '+ @TargetTable+'.'+@PKName+' FROM '+ @TargetTable +'))
+                    SET IDENTITY_INSERT '+ @TargetTable+'  OFF'
+
+            SELECT @String
+                   -- select @SourceTable
+                    DELETE FROM @ColumnTab
+                    WHERE id = @i
+
+                    SET @i = @i + 1
+            --SELECT @i
+            BEGIN TRY
+            exec (@String)
+            END TRY
+            BEGIN CATCH
+
+                SELECT @String, ERROR_MESSAGE()
+            end catch
+
+        END
