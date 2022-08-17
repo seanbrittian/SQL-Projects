@@ -1,0 +1,205 @@
+CREATE PROCEDURE [Automatic_ASRS_Lane_Assignment]
+/*
+    Created on 09-17-2021
+    By Sean Brittian
+    Updated on 09-17-2021
+    Bu Sean Brittian
+*/
+
+AS
+BEGIN
+
+    DECLARE @Tab TABLE (cnt FLOAT, Item VARCHAR(20), perc DECIMAL(18,4), carline VARCHAR(10), laneType INT)--table to organize scheduled items by count
+    DECLARE @Tab1 TABLE (cnt int, item varchar(40), perc decimal(18,4), percRound decimal(18,4), laneQty decimal(18,4), lanesNotRound decimal(18,4), lanesRound decimal(18,4), carline VARCHAR(20), history INT, laneType INT) --The table for staging lane assignments
+    DECLARE @SchedQty INT = (SELECT Value_1 FROM StorageCfg WHERE id = 2)-- 400 --Total amount to pull from the schedule
+    DECLARE @OrderTab TABLE (OrderNbr VARCHAR(50))
+     DECLARE @startseq VARCHAR(20) = (SELECT TOP 1 Order_Nbr FROM MES_data_Job_Ctl WHERE FinishBld_DTTM IS NOT NULL and Ship_Pallet IS NOT NULL and Order_Nbr  NOT LIKE 'R%'  and Order_Nbr NOT LIKE 'M%' and Order_Nbr NOT LIKE 'G%'  ORDER BY FinishBld_DTTM DESC)
+        INSERT INTO @OrderTab(OrderNbr)
+            (select DISTINCT TOP (@SchedQty) Brdcst_Nbr as Order_Nbr from ISS_data_866_Hedr a join ISS_data_866_Dtl b on a.Hedr_866_ID=b.Hedr_866_ID where Item_Type like 'SKU%' and Brdcst_Nbr>= @startseq)order by Order_Nbr
+        /*This section pulls out the scheduled orders and organizes the in a new table based on count of each SKU*/
+        INSERT INTO @Tab(CNT, ITEM, carline)
+        (select DISTINCT COUNT(Brdcst_Nbr)  as Count , TrimCodeGroup, c.Carline
+            from ISS_data_866_Hedr a
+                join ISS_data_866_Dtl b on a.Hedr_866_ID=b.Hedr_866_ID
+                    JOIN ISS_cfg_Item_Master c ON b.Item_Nbr = c.Item_Nbr
+                         JOIN TrimCodes ON TrimCode = b.Item_Nbr
+                    where b.Item_Type like 'SKU%'  and Brdcst_Nbr IN (SELECT * FROM @OrderTab)
+                        GROUP BY TrimCodeGroup, c.Carline)
+                        order by Count
+
+        /*This section places each SKU into a Lane Type based on the % the represent in the scheduled orders*/
+        DECLARE @W INT = (SELECT SUM(cnt) FROM @Tab WHERE carline = '483') --483 types SKU's
+        DECLARE @X INT = (SELECT SUM(cnt) FROM @Tab WHERE cnt >= 18 and carline <> '483') --based on total quantity
+        DECLARE @Y INT = (SELECT SUM(cnt) FROM @Tab WHERE cnt >= 9 and cnt < 18 and carline <> '483')
+        DECLARE @Z INT = (SELECT SUM(cnt) FROM @Tab WHERE cnt < 9 and carline<> '483')
+
+        UPDATE @Tab
+            SET perc = (select ((cnt*100.00) / @W ) where carline = '483'), laneType = 3--Creates percentage of schedule for lane type
+            WHERE carline = '483'
+        UPDATE @Tab
+            SET perc = (select ((cnt*100.00) / @X ) where carline <> '483'),  laneType = 4
+            WHERE perc IS NULL and cnt >= 18 and carline <> '483'
+        UPDATE @Tab
+            SET perc = (select ((cnt*100.00) / @Y ) where carline <> '483'),  laneType = 2
+            WHERE perc IS NULL and cnt >= 9 and cnt < 18 and carline <> '483'
+        UPDATE @Tab
+            SET perc = (select ((cnt*100.00) / @Z ) where carline <> '483'),  laneType = 1
+            WHERE perc IS NULL and cnt < 9 and carline<> '483'
+
+        DECLARE @Lane1 INT =(SELECT Count(LaneType) FROM StorageLaneType WHERE LaneType = 1 GROUP BY LaneType) --Total lanes of each type available
+        ,@Lane2 INT =(SELECT Count(LaneType) FROM StorageLaneType WHERE LaneType = 2 GROUP BY LaneType)
+        ,@Lane3 INT =(SELECT Count(LaneType) FROM StorageLaneType WHERE LaneType = 3 GROUP BY LaneType)
+        ,@Lane4 INT =(SELECT Count(LaneType) FROM StorageLaneType WHERE LaneType = 4 GROUP BY LaneType)
+        /*This section creates a schedule of SKU's present in the orders and required lanes to support them*/
+        INSERT INTO @Tab1(cnt, item, perc, percRound, laneQty, lanesNotRound, lanesRound, carline, laneType)
+            (SELECT cnt, Item, perc, ROUND(perc, -0.1000), IIF(laneType >= 2,(cnt /9), 1 ) as LaneQty, --Breaks down to lane type and available lanes for each.
+                    IIF(laneType=3, ((perc*0.01)*@Lane3 ),--Creates lane requirement based of % of occurrence each SKU has in orders. Divides the % by the number of lanes available of that type.
+                        IIF(laneType = 4, ((perc*0.01)*@Lane4 ),
+                            IIF(laneType=2, ((perc*0.01)*@Lane2),
+                            ((perc*0.01)*@Lane1)))) as LanesNotRound,
+                    IIF(laneType=3, ROUND(((perc*0.01)*@Lane3 ),-0.1000), --Divides the % by the number of lanes available of that type and rounds that number for whole number, lane requirement
+                        IIF(laneType = 4, ROUND(((perc*0.01)*@Lane4 ),-0.1000),
+                            IIF(laneType=2, ROUND(((perc*0.01)*@Lane2),-0.1000),
+                            ROUND(((perc*0.01)*@Lane1),-0.1000)))) as Lanes
+                        , carline, laneType FROM @Tab) order by LaneQty, Lanes desc
+        /*This section adjusts the SKU to lane assignment requirement to ensure no more or less lanes are used than available*/
+        DECLARE
+            @One INT = (SELECT SUM(lanesRound) FROM @Tab1 WHERE laneType = 1 AND lanesRound>0), --Produce the difference between lanes available and lanes scheduled
+            @Two INT = (SELECT SUM(lanesRound) FROM @Tab1 WHERE laneType = 2 AND lanesRound>0),
+            @Three INT = (SELECT SUM(lanesRound) FROM @Tab1 WHERE laneType = 3 AND lanesRound>0),
+            @Four INT = (SELECT SUM(lanesRound) FROM @Tab1 WHERE laneType = 4 AND lanesRound>0)
+            --SELECT @One, @Two, @Three, @Four, @Lane1, @Lane2, @Lane3, @Lane4
+
+            IF @One<@Lane1 --If there are less lanes used than available, add 1 lane to the amount of next top runners equaling the difference
+                Begin
+                   UPDATE @Tab1
+                    SET lanesRound = 1
+                    WHERE item IN (SELECT TOP (@Lane1 - @One) item FROM @Tab1 WHERE lanesRound = 0 and laneType = 1 ORDER BY perc DESC )
+                end
+            ELSE --If there are more lanes used than available, subtract 1 lane to the amount of top runners equaling the difference
+                Begin
+                   UPDATE @Tab1
+                    SET lanesRound = lanesRound - 1
+                    WHERE item IN (SELECT TOP (@One - @Lane1) item FROM @Tab1 WHERE lanesRound > 0 and laneType = 1 ORDER BY perc )
+                end
+
+            IF @Two<@Lane2
+                Begin
+                   UPDATE @Tab1
+                    SET lanesRound = 1
+                    WHERE item IN (SELECT TOP (@Lane2 - @Two) item FROM @Tab1 WHERE lanesRound = 0 and laneType = 2 ORDER BY perc DESC )
+                end
+            ELSE
+                Begin
+                   UPDATE @Tab1
+                    SET lanesRound = lanesRound - 1
+                    WHERE item IN (SELECT TOP (@Two - @Lane2) item FROM @Tab1 WHERE lanesRound > 0 and laneType = 2 ORDER BY perc  )
+                end
+
+            IF @Three <@Lane3
+                Begin
+                   UPDATE @Tab1
+                    SET lanesRound = 1
+                    WHERE item IN (SELECT TOP (@Lane3 - @Three) item FROM @Tab1 WHERE lanesRound = 0 and laneType = 3 ORDER BY perc DESC )
+                end
+            ELSE
+                Begin
+                   UPDATE @Tab1
+                    SET lanesRound = lanesRound - 1
+                    WHERE item IN (SELECT TOP (@Three - @Lane3) item FROM @Tab1 WHERE lanesRound > 0 and laneType = 3 ORDER BY perc  )
+                end
+
+            IF @Four <@Lane4
+                Begin
+                   UPDATE @Tab1
+                    SET lanesRound = 1
+                    WHERE item IN (SELECT TOP ( @Lane4 - @Four ) item FROM @Tab1 WHERE lanesRound = 0 and laneType = 4 ORDER BY perc DESC )
+                end
+            ELSE
+                Begin
+                   UPDATE @Tab1
+                    SET lanesRound = lanesRound - 1
+                    WHERE item IN (SELECT TOP ( @Four - @Lane4) item FROM @Tab1 WHERE lanesRound > 0 and laneType = 4 ORDER BY perc  )
+                end
+
+
+        /*Clear out the table*/
+        UPDATE StorageLaneTrimCodeGroups
+        SET TrimCodeGroup1= null, TrimCodeGroup2= null,TrimCodeGroup3= null, TrimCodeGroup4= null, TrimCodeGroup5 = null, Overflow = 0
+        /*Preforms the assignment of bins*/
+        DECLARE @Lt int = 1 --References LaneType
+        WHILE @Lt <= 4
+            BEGIN
+                IF (SELECT COUNT(lanesRound) From @Tab1 WHERE lanesRound > 0 and laneType = @Lt)>0 --Get count of lanes to be schedule
+                    begin
+                        DECLARE @sk INT =(SELECT COUNT(item) From @Tab1 WHERE lanesRound > 0 and laneType = @Lt) --Get count of SKU's to be scheduled
+                        WHILE @sk >0
+                            begin
+                                DECLARE @item VARCHAR(40) = (SELECT top 1 item From @Tab1 WHERE lanesRound > 0 and laneType = @Lt ORDER BY lanesNotRound DESC ) --Select the highest value SKU from pre-table
+                                DECLARE @totAv INT =(CONVERT(INT, (SELECT lanesRound From @Tab1 WHERE lanesRound > 0 and item = @item))) --Count of lanes to be scheduled for item
+
+                                IF @Lt = 3 --483 SKU's
+                                    Begin
+                                        UPDATE StorageLaneTrimCodeGroups
+                                            SET TrimCodeGroup1 = @item
+                                            WHERE LaneNumber IN (SELECT TOP(@totAv) LaneNumber FROM StorageLaneTrimCodeGroups JOIN StorageLaneType ON LaneNumber = Lane WHERE LaneType = @Lt and TrimCodeGroup1 is null order by Heat) --Update 1st Lane with item sorted by heat
+
+                                        DELETE FROM @Tab1
+                                             WHERE item = @item
+                                    end
+                                ELSE
+                                    Begin
+                                        DECLARE @Bit INT = 0--Pick side for lane balancing
+                                        WHILE @totAv > 0--Lanes required greater the 0
+                                            Begin
+                                                IF (SELECT TOP 1 LaneNumber FROM StorageLaneTrimCodeGroups JOIN StorageLaneType ON LaneNumber = Lane WHERE LaneType = @Lt and TrimCodeGroup1 is null And Side = @Bit order by Heat) IS NOT NULL --Ensure update 'where' clause will produce a value
+                                                    Begin
+                                                        UPDATE  StorageLaneTrimCodeGroups
+                                                            SET TrimCodeGroup1 = @item
+                                                            WHERE LaneNumber = (SELECT TOP 1 LaneNumber FROM StorageLaneTrimCodeGroups JOIN StorageLaneType ON LaneNumber = Lane WHERE LaneType = @Lt and TrimCodeGroup1 is null And Side = @Bit order by Heat)--Update 1st Lane with item sorted by LaneType, heat, and side
+
+                                                        UPDATE @Tab1 --Tick down amount of lanes needed for given item
+                                                            SET lanesRound = lanesRound - 1
+                                                            WHERE item = @item
+                                                    end
+                                                ELSE--If first statement null, no lanes are available on that side
+                                                    Begin
+                                                        SET @Bit = CASE WHEN @Bit = 1 then 0 WHEN @Bit = 0 THEN 1 END --Changes the side
+                                                         UPDATE  StorageLaneTrimCodeGroups --Attempts to assign to other side
+                                                            SET TrimCodeGroup1 = @item
+                                                            WHERE LaneNumber = (SELECT TOP 1 LaneNumber FROM StorageLaneTrimCodeGroups JOIN StorageLaneType ON LaneNumber = Lane WHERE LaneType = @Lt and TrimCodeGroup1 is null And Side = @Bit order by Heat)
+
+                                                        UPDATE @Tab1 --Tick down amount of lanes needed for given item
+                                                            SET lanesRound = lanesRound - 1
+                                                            WHERE item = @item
+                                                    end
+
+                                                SET @Bit = CASE WHEN @Bit = 1 then 0 WHEN @Bit = 0 THEN 1 END --Switch side
+                                                SET @totAv = @totAv - 1 -- Tick down count for assignment
+                                            end
+                                    end
+                                SET @sk = @sk - 1 --Switch SKU
+                            end
+                    end
+                 SET @Lt = @Lt + 1 --Switch Lane Type
+            end
+            /*This section is the last catch to clean up any left over assignments*/
+            IF (SELECT COUNT(TrimCodeGroup1) FROM StorageLaneTrimCodeGroups  RIGHT JOIN StorageLaneType ON LaneNumber = Lane WHERE TrimCodeGroup1 IS NULL and LaneType NOT IN (0, 9)) > 0 --Any remaining lanes that aren't overflow or off
+                Begin
+                    DECLARE @CleanUp INT = (SELECT COUNT(TrimCodeGroup1) FROM StorageLaneTrimCodeGroups WHERE TrimCodeGroup1 IS NULL and LaneNumber NOT IN (SELECT Lane FROM StorageLaneType WHERE LaneType IN (0, 9) )) --Get remaining lanes
+                    WHILE @CleanUp > 0 --Go till lanes are gone
+                        Begin
+                            UPDATE StorageLaneTrimCodeGroups
+                                SET TrimCodeGroup1 = (SELECT TOP 1 item from @Tab1 WHERE item NOT IN (SELECT TrimCodeGroup1 FROM StorageLaneTrimCodeGroups) order by lanesNotRound)
+                                WHERE TrimCodeGroup1 is null and LaneNumber NOT IN (SELECT Lane FROM StorageLaneType WHERE LaneType IN (0, 9))
+                            SET @CleanUp = @CleanUp - 1 --Tick down remaining lanes
+                        end
+                    UPDATE StorageLaneTrimCodeGroups -- If any lanes still remain un-assigned, set them to overflows
+                    SET Overflow = 1
+                    WHERE TrimCodeGroup1 IS NULL
+
+                end
+
+END
+go
+
